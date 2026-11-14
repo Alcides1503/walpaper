@@ -116,6 +116,8 @@ if sys.platform == "win32":
     user32.SetWindowPos.argtypes = [HWND, HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                     ctypes.c_int, wintypes.UINT]
     user32.SetWindowPos.restype = wintypes.BOOL
+    user32.RedrawWindow.argtypes = [HWND, ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]
+    user32.RedrawWindow.restype = wintypes.BOOL
     user32.GetWindowRect.argtypes = [HWND, ctypes.POINTER(wintypes.RECT)]
     user32.GetWindowRect.restype = wintypes.BOOL
     user32.MonitorFromWindow.argtypes = [HWND, wintypes.DWORD]
@@ -253,10 +255,13 @@ def attach_to_desktop(widget, host):
 
 
 def place(widget, x, y, w, h):
+    """Posiciona/mostra a janela sem esperar pelo Explorer (SWP_ASYNCWINDOWPOS evita travar)."""
     hwnd = int(widget.winId())
     vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
-    user32.MoveWindow(hwnd, x - vx, y - vy, w, h, True)
-    user32.ShowWindow(hwnd, 5)
+    # SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS
+    user32.SetWindowPos(hwnd, None, x - vx, y - vy, w, h, 0x0004 | 0x0010 | 0x0040 | 0x4000)
+    # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+    user32.RedrawWindow(hwnd, None, None, 0x0001 | 0x0004 | 0x0080 | 0x0100)
 
 
 # =============================================================== PLAYER ======
@@ -369,6 +374,11 @@ class PlayerApp:
         self.last_pos = -1
         self.stuck = 0
         self.pending = None
+        self.in_fs = False
+        self.fs_hits = 0
+        self.nofs_hits = 0
+        self.fs_since = 0.0
+        self.last_tick = 0.0
         self.retry_at = 0
         self.fail_count = 0
         self.n = 0
@@ -471,13 +481,12 @@ class PlayerApp:
 
     def after_fullscreen(self):
         try:
-            if fullscreen_app_active():
-                self.was_fs = True  # voltou para tela cheia; espera de novo
-                return
+            if self.in_fs:
+                return  # voltou para tela cheia; espera sair de novo
             if not self.wallpapers or not self.current:
                 return
-            log("saiu da tela cheia; recriando wallpaper")
-            self.safe_build(self.current, keep_position=True)  # recriacao completa, sem piscar
+            log("recriando wallpaper depois da tela cheia")
+            self.safe_build(self.current, keep_position=True)
         except Exception:
             log("ERRO apos tela cheia:\n" + traceback.format_exc())
 
@@ -517,6 +526,10 @@ class PlayerApp:
 
     def tick(self):
         self.n += 1
+        now_t = time.time()
+        if self.last_tick and now_t - self.last_tick > 3:
+            log(f"thread do player ficou parada por {now_t - self.last_tick:.1f}s")
+        self.last_tick = now_t
         try:
             if self.parent_pid and not pid_alive(self.parent_pid):
                 return self.quit()
@@ -538,22 +551,36 @@ class PlayerApp:
                 self.safe_build(path)
                 return
 
-            fs = fullscreen_app_active()
-            if fs:
-                if not self.was_fs:
-                    log("tela cheia detectada")
-                self.was_fs = True
+            # --- tela cheia com debounce: entra apos ~1s seguido, sai apos ~1,5s sem
+            if fullscreen_app_active():
+                self.fs_hits += 1
+                self.nofs_hits = 0
+            else:
+                self.nofs_hits += 1
+                self.fs_hits = 0
+            if not self.in_fs and self.fs_hits >= 2:
+                self.in_fs = True
+                self.fs_since = time.time()
+                log("tela cheia detectada")
                 if self.cfg.get("autopause") and not self.paused:
                     self.paused = True
                     for w in self.wallpapers:
                         w.player.pause()
+            elif self.in_fs and self.nofs_hits >= 3:
+                self.in_fs = False
+                dur = time.time() - self.fs_since
+                was_paused, self.paused = self.paused, False
+                if dur >= 3:
+                    log(f"saiu da tela cheia (durou {dur:.0f}s)")
+                    QTimer.singleShot(700, self.after_fullscreen)
+                else:
+                    log(f"tela cheia curta ({dur:.1f}s); ignorada")
+                    if was_paused:
+                        for w in self.wallpapers:
+                            w.player.play()
+            if self.in_fs:
                 return  # em tela cheia nao mexe em nada (o video segue tocando)
-            if self.paused or self.was_fs:
-                self.paused = False
-                self.was_fs = False
-                # saiu do F11/jogo: espera o Windows terminar de redesenhar e recria o wallpaper
-                QTimer.singleShot(700, self.after_fullscreen)
-            elif self.n % 4 == 0:
+            if self.n % 4 == 0:
                 self.fix_all(force=False)
         except Exception:
             log("ERRO no player:\n" + traceback.format_exc())
