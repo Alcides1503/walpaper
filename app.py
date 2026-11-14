@@ -56,8 +56,61 @@ if sys.platform == "win32":
     user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
     user32.GetSystemMetrics.argtypes = [ctypes.c_int]
     user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.GetForegroundWindow.restype = HWND
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetClassNameW.argtypes = [HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.IsWindow.argtypes = [HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetParent.argtypes = [HWND]
+    user32.GetParent.restype = HWND
+    user32.GetWindowRect.argtypes = [HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.MonitorFromWindow.argtypes = [HWND, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = wintypes.HANDLE
+    user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
 else:
     user32 = None
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+
+SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+                 "SHELLDLL_DefView", "XamlExplorerHostIslandWindow"}
+
+
+def fullscreen_app_active():
+    """True se o programa em primeiro plano cobre o monitor inteiro (jogo, F11, etc.)."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        return False
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    if buf.value in SHELL_CLASSES:
+        return False
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if pid.value == os.getpid():
+        return False
+    r = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return False
+    mon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+        return False
+    m = mi.rcMonitor
+    return r.left <= m.left and r.top <= m.top and r.right >= m.right and r.bottom >= m.bottom
 
 
 def log(msg):
@@ -151,12 +204,22 @@ class ScreenWallpaper(QVideoWidget):
                       int(g.width() * dpr), int(g.height() * dpr))
         self.winId()  # garante o HWND antes de encaixar
         self.show()
-        _attach_to_desktop(self, _find_desktop_host())
+        self.host = _find_desktop_host()
+        _attach_to_desktop(self, self.host)
         _place(self, *self._rect)
         self.player.play()
         # o Qt pode reaplicar o tamanho padrao depois de exibir; reaplica o tamanho da tela
         for ms in (100, 400, 1200):
             QTimer.singleShot(ms, self._reapply)
+
+    def healthy(self):
+        """False se a janela foi destruida ou desencaixada do desktop."""
+        try:
+            hwnd = int(self.winId())
+            return bool(user32.IsWindow(self.host) and user32.IsWindow(hwnd)
+                        and user32.GetParent(hwnd) == self.host)
+        except Exception:
+            return False
 
     def _reapply(self):
         try:
@@ -198,10 +261,14 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(make_icon())
         self.resize(520, 520)
         self.wallpapers = []
+        self.paused = False
         self.cfg = self.load_config()
         self.build_ui()
         self.build_tray()
         self.refresh_list()
+        self.guard = QTimer(self)
+        self.guard.timeout.connect(self.guard_tick)
+        self.guard.start(2000)
 
         if self.cfg.get("active") and self.cfg.get("current"):
             QTimer.singleShot(1500, lambda: self.activate(self.cfg["current"]))
@@ -218,7 +285,7 @@ class MainWindow(QMainWindow):
             for f in bundled.iterdir():
                 if f.is_file() and not (LIB_DIR / f.name).exists():
                     shutil.copy2(f, LIB_DIR / f.name)
-        cfg = {"current": None, "active": False, "muted": True, "volume": 50, "fill": True}
+        cfg = {"current": None, "active": False, "muted": True, "volume": 50, "fill": True, "autopause": True}
         if CONFIG.exists():
             try:
                 cfg.update(json.loads(CONFIG.read_text("utf-8")))
@@ -280,6 +347,11 @@ class MainWindow(QMainWindow):
         self.fit.currentIndexChanged.connect(self.on_fit)
         frow.addWidget(self.fit)
         lay.addLayout(frow)
+
+        self.chk_pause = QCheckBox("Pausar quando houver jogo/app em tela cheia")
+        self.chk_pause.setChecked(self.cfg["autopause"])
+        self.chk_pause.toggled.connect(self.on_autopause)
+        lay.addWidget(self.chk_pause)
 
         self.chk_boot = QCheckBox("Iniciar com o Windows")
         self.chk_boot.setChecked(self.autostart_enabled())
@@ -363,6 +435,7 @@ class MainWindow(QMainWindow):
 
     # ---- wallpaper
     def stop_all(self):
+        self.paused = False
         for w in self.wallpapers:
             w.stop()
         self.wallpapers = []
@@ -394,6 +467,37 @@ class MainWindow(QMainWindow):
         self.cfg["active"] = False
         self.save_config()
         self.refresh_list()
+
+    def on_autopause(self, on):
+        self.cfg["autopause"] = on
+        self.save_config()
+
+    def guard_tick(self):
+        if not self.wallpapers or not self.cfg.get("current"):
+            self.paused = False
+            return
+        try:
+            fs = self.cfg.get("autopause", True) and fullscreen_app_active()
+            if fs:
+                if not self.paused:
+                    self.paused = True
+                    for w in self.wallpapers:
+                        w.player.pause()
+                return
+            if self.paused:
+                # saiu do jogo/tela cheia: recria o wallpaper do zero
+                self.paused = False
+                self.activate(self.cfg["current"])
+            elif not all(w.healthy() for w in self.wallpapers):
+                log("wallpaper desencaixado/destruido; recriando")
+                self.activate(self.cfg["current"])
+            else:
+                for w in self.wallpapers:
+                    if w.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                        w.player.play()
+        except Exception:
+            import traceback
+            log(traceback.format_exc())
 
     def on_audio(self, *_):
         self.cfg["muted"], self.cfg["volume"] = self.chk_mute.isChecked(), self.vol.value()
