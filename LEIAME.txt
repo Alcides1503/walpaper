@@ -1,0 +1,15 @@
+WALLPAPER ANIMADO (Windows 10/11)
+
+1) Instale o Python 3.10+ em python.org (marque "Add Python to PATH").
+2) Duplo clique em INSTALAR.bat (so na primeira vez).
+3) Duplo clique em EXECUTAR.bat.
+
+Uso:
+- Seu video ja vem na lista. De duplo clique nele (ou "Definir como papel de parede").
+- "Adicionar video" para colocar outros; troque quando quiser.
+- "Desativar" volta ao papel de parede normal do Windows.
+- Fechar a janela minimiza para a bandeja (perto do relogio); o wallpaper continua.
+  Para sair de vez: clique direito no icone da bandeja > Sair.
+- "Iniciar com o Windows" reativa o ultimo wallpaper ao ligar o PC.
+
+Para gerar o .exe: duplo clique em CRIAR_EXE.bat (o WallpaperAnimado.exe aparece na propria pasta).
