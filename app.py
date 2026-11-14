@@ -430,6 +430,9 @@ def run_player(parent_pid):
 
 # ============================================================== CONTROLE =====
 def make_icon():
+    png = BASE_DIR / "icon.png"
+    if png.exists():
+        return QIcon(str(png))
     pm = QPixmap(64, 64)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -441,6 +444,55 @@ def make_icon():
     p.drawPolygon(QPolygon([QPoint(25, 20), QPoint(25, 44), QPoint(45, 32)]))
     p.end()
     return QIcon(pm)
+
+
+def create_desktop_shortcut():
+    """Cria 'Wallpaper Animado.lnk' na area de trabalho. Retorna (ok, mensagem)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    icon_dst = DATA_DIR / "icon.ico"
+    try:
+        src = BASE_DIR / "icon.ico"
+        if src.exists():
+            shutil.copy2(src, icon_dst)
+    except Exception:
+        pass
+
+    if getattr(sys, "frozen", False):
+        target, args = sys.executable, ""
+    else:
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        target = str(pyw if pyw.exists() else sys.executable)
+        args = f'"{Path(__file__).resolve()}"'
+    workdir = str(Path(target).parent)
+    icon = str(icon_dst) if icon_dst.exists() else target
+
+    def q(v):  # escapa aspas simples para o PowerShell
+        return str(v).replace("'", "''")
+
+    ps = (
+        "$d=[Environment]::GetFolderPath('Desktop');"
+        "$l=Join-Path $d 'Wallpaper Animado.lnk';"
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($l);"
+        f"$s.TargetPath='{q(target)}';"
+        f"$s.Arguments='{q(args)}';"
+        f"$s.WorkingDirectory='{q(workdir)}';"
+        f"$s.IconLocation='{q(icon)}';"
+        "$s.Description='Wallpaper Animado';"
+        "$s.Save();"
+        "Write-Output $l"
+    )
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           creationflags=CREATE_NO_WINDOW, capture_output=True,
+                           text=True, timeout=30)
+        out = (r.stdout or "").strip()
+        if r.returncode == 0 and out:
+            return True, out
+        log("atalho falhou: " + (r.stderr or out))
+        return False, (r.stderr or out or "erro desconhecido").strip()
+    except Exception as ex:
+        log("atalho falhou:\n" + traceback.format_exc())
+        return False, str(ex)
 
 
 class MainWindow(QMainWindow):
@@ -594,6 +646,10 @@ class MainWindow(QMainWindow):
         self.status = QLabel("")
         lay.addWidget(self.status)
 
+        b_lnk = QPushButton("🖥 Criar atalho na área de trabalho")
+        b_lnk.clicked.connect(self.make_shortcut)
+        lay.addWidget(b_lnk)
+
         self.chk_mute = QCheckBox("Sem som")
         self.chk_mute.setChecked(self.cfg["muted"])
         self.chk_mute.toggled.connect(self.on_audio)
@@ -634,14 +690,22 @@ class MainWindow(QMainWindow):
         menu = QMenu()
         a_open = QAction("Abrir", self, triggered=self.show_normal)
         a_off = QAction("Desativar wallpaper", self, triggered=self.deactivate)
+        a_lnk = QAction("Criar atalho na área de trabalho", self, triggered=self.make_shortcut)
         a_quit = QAction("Sair", self, triggered=self.quit_app)
-        for a in (a_open, a_off, a_quit):
+        for a in (a_open, a_off, a_lnk, a_quit):
             menu.addAction(a)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(
             lambda r: self.show_normal() if r == QSystemTrayIcon.Trigger else None)
         self.tray.setToolTip("Wallpaper Animado")
         self.tray.show()
+
+    def make_shortcut(self):
+        ok, msg = create_desktop_shortcut()
+        if ok:
+            QMessageBox.information(self, "Atalho criado", f"Atalho criado em:\n{msg}")
+        else:
+            QMessageBox.warning(self, "Atalho", f"Não foi possível criar o atalho:\n{msg}")
 
     def show_normal(self):
         self.showNormal(); self.activateWindow()
