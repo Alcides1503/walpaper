@@ -1,19 +1,24 @@
 """
 Wallpaper Animado para Windows 10/11
-- Usa um vídeo como papel de parede (atrás dos ícones da área de trabalho)
-- Biblioteca de vídeos: adicione quantos quiser e troque quando quiser
-- "Desativar" volta ao papel de parede normal do Windows
+
+Arquitetura (para nao travar):
+  - Processo "controle": janela, bandeja, biblioteca de videos, configuracoes.
+  - Processo "player"  : toca o video atras dos icones. Se travar, o controle
+                         detecta (heartbeat) e reinicia so o player.
 """
 import ctypes
 import json
 import os
 import shutil
+import subprocess
 import sys
+import time
+import traceback
 from ctypes import wintypes
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QTimer
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap, QBrush
+from PySide6.QtCore import Qt, QUrl, QTimer, QPoint
+from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap, QBrush, QPolygon
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -24,17 +29,56 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "WallpaperAnimado"
 VIDEO_EXTS = "Vídeos (*.mp4 *.mkv *.mov *.avi *.webm *.wmv *.m4v);;Todos (*.*)"
+CREATE_NO_WINDOW = 0x08000000
 
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 LIB_DIR = DATA_DIR / "videos"
 CONFIG = DATA_DIR / "config.json"
+HEARTBEAT = DATA_DIR / "heartbeat.txt"
+LOGFILE = DATA_DIR / "log.txt"
 
+DEFAULT_CFG = {"current": None, "active": False, "muted": True, "volume": 50,
+               "fill": True, "autopause": False}
+
+
+# ------------------------------------------------------------ utilidades ----
+def log(msg):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if LOGFILE.exists() and LOGFILE.stat().st_size > 512_000:
+            LOGFILE.write_text("", "utf-8")
+        with open(LOGFILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def read_cfg():
+    cfg = dict(DEFAULT_CFG)
+    try:
+        cfg.update(json.loads(CONFIG.read_text("utf-8")))
+    except Exception:
+        pass
+    return cfg
+
+
+def write_cfg(cfg):
+    """Escrita atomica: o player nunca le um arquivo pela metade."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2), "utf-8")
+    os.replace(tmp, CONFIG)
+
+
+# ----------------------------------------------------------------- Win32 ----
 HWND = wintypes.HWND
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, HWND, wintypes.LPARAM)
 
 if sys.platform == "win32":
     user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
     user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
     user32.FindWindowW.restype = HWND
     user32.FindWindowExW.argtypes = [HWND, HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
@@ -56,8 +100,8 @@ if sys.platform == "win32":
     user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
     user32.GetSystemMetrics.argtypes = [ctypes.c_int]
     user32.GetSystemMetrics.restype = ctypes.c_int
-    user32.GetForegroundWindow.restype = HWND
     user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = HWND
     user32.GetClassNameW.argtypes = [HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetWindowThreadProcessId.argtypes = [HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
@@ -75,8 +119,15 @@ if sys.platform == "win32":
     user32.MonitorFromWindow.restype = wintypes.HANDLE
     user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
     user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 else:
     user32 = None
+    kernel32 = None
 
 
 class MONITORINFO(ctypes.Structure):
@@ -86,6 +137,18 @@ class MONITORINFO(ctypes.Structure):
 
 SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
                  "SHELLDLL_DefView", "XamlExplorerHostIslandWindow"}
+
+
+def pid_alive(pid):
+    if not pid:
+        return True
+    h = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not h:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(h)
 
 
 def fullscreen_app_active():
@@ -113,34 +176,14 @@ def fullscreen_app_active():
     return r.left <= m.left and r.top <= m.top and r.right >= m.right and r.bottom >= m.bottom
 
 
-def log(msg):
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with open(DATA_DIR / "log.txt", "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-    except Exception:
-        pass
-
-
-# ----------------------------------------------------------------- Win32 ----
-def _find_desktop_host():
-    """Retorna o HWND (WorkerW/Progman) onde o video deve ser encaixado,
-    atras dos icones. Funciona no Windows 10 e no Windows 11 (incl. 24H2)."""
+def _find_workerw():
     progman = user32.FindWindowW("Progman", None)
     if not progman:
         raise RuntimeError("Janela Progman nao encontrada")
-    res = ctypes.c_size_t()
-    # Pede ao Explorer para criar a janela WorkerW atras dos icones
-    for wparam, lparam in ((0xD, 0), (0xD, 1), (0, 0)):
-        user32.SendMessageTimeoutW(progman, 0x052C, wparam, lparam, 0, 1000, ctypes.byref(res))
-
     # Windows 11 24H2+: WorkerW e filho do Progman
     child = user32.FindWindowExW(progman, None, "WorkerW", None)
     if child:
-        log("host: WorkerW filho do Progman")
         return child
-
-    # Windows 10 / 11 antigo: WorkerW irmao logo apos o que contem os icones
     found = []
 
     def enum_proc(hwnd, _):
@@ -152,14 +195,24 @@ def _find_desktop_host():
 
     cb = WNDENUMPROC(enum_proc)
     user32.EnumWindows(cb, 0)
-    if found:
-        log("host: WorkerW irmao")
-        return found[0]
-    log("host: usando Progman")
+    return found[0] if found else None
+
+
+def find_desktop_host():
+    """HWND onde o video e encaixado, atras dos icones (Windows 10 e 11)."""
+    progman = user32.FindWindowW("Progman", None)
+    if not progman:
+        raise RuntimeError("Janela Progman nao encontrada")
+    res = ctypes.c_size_t()
+    for wparam, lparam in ((0xD, 0), (0xD, 1), (0, 0)):
+        user32.SendMessageTimeoutW(progman, 0x052C, wparam, lparam, 0, 500, ctypes.byref(res))
+        host = _find_workerw()
+        if host:
+            return host
     return progman
 
 
-def _attach_to_desktop(widget, host):
+def attach_to_desktop(widget, host):
     hwnd = int(widget.winId())
     GWL_STYLE, WS_CHILD, WS_POPUP = -16, 0x40000000, 0x80000000
     style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
@@ -167,25 +220,23 @@ def _attach_to_desktop(widget, host):
     user32.SetParent(hwnd, host)
 
 
-def _place(widget, x, y, w, h):
+def place(widget, x, y, w, h):
     hwnd = int(widget.winId())
-    # coordenadas relativas ao host (origem = canto do desktop virtual)
     vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
     user32.MoveWindow(hwnd, x - vx, y - vy, w, h, True)
     user32.ShowWindow(hwnd, 5)
 
 
-# ------------------------------------------------------------- Wallpaper ----
+# =============================================================== PLAYER ======
 class ScreenWallpaper(QVideoWidget):
     def __init__(self, screen, path, muted, volume, fill, start_pos=0):
         super().__init__()
         self.screen_ref = screen
         self._start_pos = start_pos
+        self.host = None
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_NativeWindow, True)
-        self.setAspectRatioMode(
-            Qt.KeepAspectRatioByExpanding if fill else Qt.KeepAspectRatio
-        )
+        self.setAspectRatioMode(Qt.KeepAspectRatioByExpanding if fill else Qt.KeepAspectRatio)
         self.setStyleSheet("background:black;")
 
         self.player = QMediaPlayer(self)
@@ -211,30 +262,31 @@ class ScreenWallpaper(QVideoWidget):
         g = self.screen_ref.geometry()
         self._rect = (int(g.x() * dpr), int(g.y() * dpr),
                       int(g.width() * dpr), int(g.height() * dpr))
-        self.winId()  # garante o HWND antes de encaixar
+        self.setGeometry(g)
+        self.winId()
         self.show()
-        self.host = _find_desktop_host()
-        _attach_to_desktop(self, self.host)
-        _place(self, *self._rect)
+        self.host = find_desktop_host()
+        attach_to_desktop(self, self.host)
+        place(self, *self._rect)
         self.player.play()
-        # o Qt pode reaplicar o tamanho padrao depois de exibir; reaplica o tamanho da tela
         for ms in (100, 400, 1200):
             QTimer.singleShot(ms, self._reapply)
 
-    def healthy(self):
-        """False se a janela foi destruida ou desencaixada do desktop."""
-        try:
-            hwnd = int(self.winId())
-            return bool(user32.IsWindow(self.host) and user32.IsWindow(hwnd)
-                        and user32.GetParent(hwnd) == self.host)
-        except Exception:
-            return False
-
     def _reapply(self):
         try:
-            _place(self, *self._rect)
+            place(self, *self._rect)
         except Exception:
             pass
+
+    def healthy(self, strict=True):
+        try:
+            hwnd = int(self.winId())
+            ok = bool(user32.IsWindow(self.host) and user32.IsWindow(hwnd))
+            if ok and strict:
+                ok = user32.GetParent(hwnd) == self.host
+            return ok
+        except Exception:
+            return False
 
     def stop(self):
         try:
@@ -246,7 +298,137 @@ class ScreenWallpaper(QVideoWidget):
             pass
 
 
-# -------------------------------------------------------------- Janela ------
+class PlayerApp:
+    """Roda no processo player: obedece o config.json e se auto-repara."""
+
+    def __init__(self, parent_pid):
+        self.parent_pid = parent_pid
+        self.wallpapers = []
+        self.cfg = read_cfg()
+        self.sig = None
+        self.current = None
+        self.paused = False
+        self.was_fs = False
+        self.rebuilds = []
+        self.strict = True
+        self.n = 0
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(500)
+        self.tick()
+
+    def heartbeat(self):
+        try:
+            HEARTBEAT.write_text(f"{os.getpid()} {time.time()}", "utf-8")
+        except Exception:
+            pass
+
+    def reload_cfg(self):
+        try:
+            st = CONFIG.stat()
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return
+        if sig == self.sig:
+            return
+        try:
+            cfg = json.loads(CONFIG.read_text("utf-8"))
+        except Exception:
+            return  # arquivo sendo escrito; tenta no proximo ciclo
+        self.sig = sig
+        self.cfg = {**DEFAULT_CFG, **cfg}
+        for w in self.wallpapers:
+            w.audio.setMuted(self.cfg["muted"])
+            w.audio.setVolume(self.cfg["volume"] / 100)
+            w.setAspectRatioMode(Qt.KeepAspectRatioByExpanding if self.cfg["fill"] else Qt.KeepAspectRatio)
+
+    def build(self, path, keep_position=False):
+        pos = 0
+        if keep_position and self.wallpapers:
+            try:
+                pos = int(self.wallpapers[0].player.position())
+            except Exception:
+                pos = 0
+        self.stop_walls()
+        for sc in QApplication.screens():
+            w = ScreenWallpaper(sc, path, self.cfg["muted"], self.cfg["volume"], self.cfg["fill"], pos)
+            self.wallpapers.append(w)
+            w.start()
+        self.current = path
+
+    def stop_walls(self):
+        for w in self.wallpapers:
+            w.stop()
+        self.wallpapers = []
+
+    def rebuild(self):
+        now = time.time()
+        self.rebuilds = [t for t in self.rebuilds if now - t < 60]
+        if len(self.rebuilds) >= 6:
+            log("muitas recriacoes em 1 minuto; ignorando")
+            self.strict = False
+            return
+        self.rebuilds.append(now)
+        self.build(self.current, keep_position=True)
+
+    def quit(self):
+        self.timer.stop()
+        self.stop_walls()
+        QApplication.quit()
+
+    def tick(self):
+        self.n += 1
+        try:
+            if self.parent_pid and not pid_alive(self.parent_pid):
+                return self.quit()
+            if self.n % 2 == 0 or self.n == 1:
+                self.heartbeat()
+            self.reload_cfg()
+            if not self.cfg.get("active") or not self.cfg.get("current"):
+                return self.quit()
+            path = self.cfg["current"]
+            if not Path(path).exists():
+                log("video nao existe: " + path)
+                return self.quit()
+            if path != self.current:
+                self.build(path)
+                return
+
+            fs = fullscreen_app_active()
+            if fs:
+                self.was_fs = True
+                if self.cfg.get("autopause") and not self.paused:
+                    self.paused = True
+                    for w in self.wallpapers:
+                        w.player.pause()
+                return  # em tela cheia nao mexe em nada (o video segue tocando)
+            if self.paused or self.was_fs:
+                self.paused = False
+                self.was_fs = False
+                self.rebuild()  # saiu do jogo: refaz e continua de onde estava
+            elif self.n % 4 == 0:
+                if not all(w.healthy(self.strict) for w in self.wallpapers):
+                    log("wallpaper desencaixado/destruido; recriando")
+                    self.rebuild()
+                else:
+                    for w in self.wallpapers:
+                        if w.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                            w.player.play()
+        except Exception:
+            log("ERRO no player:\n" + traceback.format_exc())
+            self.timer.stop()
+            self.stop_walls()
+            QApplication.exit(2)  # codigo 2 = falha ao ativar
+
+
+def run_player(parent_pid):
+    app = QApplication([sys.argv[0]])
+    app.setQuitOnLastWindowClosed(False)
+    pa = PlayerApp(parent_pid)  # noqa: F841 (mantem referencia viva)
+    sys.exit(app.exec())
+
+
+# ============================================================== CONTROLE =====
 def make_icon():
     pm = QPixmap(64, 64)
     pm.fill(Qt.transparent)
@@ -256,8 +438,6 @@ def make_icon():
     p.setPen(Qt.NoPen)
     p.drawRoundedRect(4, 4, 56, 56, 14, 14)
     p.setBrush(QBrush(QColor("white")))
-    from PySide6.QtGui import QPolygon
-    from PySide6.QtCore import QPoint
     p.drawPolygon(QPolygon([QPoint(25, 20), QPoint(25, 44), QPoint(45, 32)]))
     p.end()
     return QIcon(pm)
@@ -268,20 +448,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Wallpaper Animado")
         self.setWindowIcon(make_icon())
-        self.resize(520, 520)
-        self.wallpapers = []
-        self.paused = False
-        self.was_fs = False
+        self.resize(520, 540)
+        self.proc = None
+        self.proc_started = 0.0
+        self.starts = []
         self.cfg = self.load_config()
         self.build_ui()
         self.build_tray()
         self.refresh_list()
+
         self.guard = QTimer(self)
         self.guard.timeout.connect(self.guard_tick)
         self.guard.start(2000)
 
         if self.cfg.get("active") and self.cfg.get("current"):
-            QTimer.singleShot(1500, lambda: self.activate(self.cfg["current"]))
+            QTimer.singleShot(1500, self.start_player)
         if not start_hidden:
             self.show()
 
@@ -289,22 +470,100 @@ class MainWindow(QMainWindow):
     def load_config(self):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         LIB_DIR.mkdir(parents=True, exist_ok=True)
-        # copia o(s) vídeo(s) que vêm junto do programa na primeira execução
         bundled = BASE_DIR / "videos"
         if bundled.exists():
             for f in bundled.iterdir():
                 if f.is_file() and not (LIB_DIR / f.name).exists():
                     shutil.copy2(f, LIB_DIR / f.name)
-        cfg = {"current": None, "active": False, "muted": True, "volume": 50, "fill": True, "autopause": False}
-        if CONFIG.exists():
-            try:
-                cfg.update(json.loads(CONFIG.read_text("utf-8")))
-            except Exception:
-                pass
-        return cfg
+        return read_cfg()
 
     def save_config(self):
-        CONFIG.write_text(json.dumps(self.cfg, indent=2), "utf-8")
+        write_cfg(self.cfg)
+
+    # ---- processo do player
+    def player_alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start_player(self):
+        if self.player_alive() or not self.cfg.get("active"):
+            return
+        now = time.time()
+        self.starts = [t for t in self.starts if now - t < 60]
+        if len(self.starts) >= 5:
+            log("player falhou 5x em 1 minuto; desativando")
+            self.cfg["active"] = False
+            self.save_config()
+            self.refresh_list()
+            self.tray.showMessage("Wallpaper Animado",
+                                  f"O wallpaper falhou varias vezes. Veja {LOGFILE}",
+                                  QSystemTrayIcon.Warning, 5000)
+            return
+        self.starts.append(now)
+        env = os.environ.copy()
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # player independente do controle
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--player", str(os.getpid())]
+        else:
+            pyw = Path(sys.executable).with_name("pythonw.exe")
+            exe = pyw if pyw.exists() else Path(sys.executable)
+            cmd = [str(exe), str(Path(__file__).resolve()), "--player", str(os.getpid())]
+        try:
+            self.proc = subprocess.Popen(cmd, env=env, creationflags=CREATE_NO_WINDOW,
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, close_fds=True)
+            self.proc_started = time.time()
+            log(f"player iniciado (pid {self.proc.pid})")
+        except Exception:
+            log("falha ao iniciar player:\n" + traceback.format_exc())
+            self.proc = None
+
+    def read_heartbeat(self):
+        try:
+            pid, t = HEARTBEAT.read_text("utf-8").split()
+            return int(pid), float(t)
+        except Exception:
+            return None
+
+    def kill_player(self):
+        pids = set()
+        if self.player_alive():
+            pids.add(self.proc.pid)
+        hb = self.read_heartbeat()
+        if hb and hb[1] >= self.proc_started - 1 and self.proc_started:
+            pids.add(hb[0])
+        for pid in pids:
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                               creationflags=CREATE_NO_WINDOW, capture_output=True, timeout=10)
+            except Exception:
+                pass
+        self.proc = None
+
+    def guard_tick(self):
+        try:
+            if not self.cfg.get("active") or not self.cfg.get("current"):
+                return
+            if self.player_alive():
+                hb = self.read_heartbeat()
+                ref = max(hb[1] if hb else 0, self.proc_started)
+                if time.time() - ref > 25:
+                    log("player sem sinal ha 25s (travado); reiniciando")
+                    self.kill_player()
+                else:
+                    return
+            else:
+                code = self.proc.poll() if self.proc is not None else None
+                if code == 2:
+                    self.cfg["active"] = False
+                    self.save_config()
+                    self.proc = None
+                    self.refresh_list()
+                    QMessageBox.critical(self, "Erro ao ativar",
+                                         f"Nao foi possivel ativar o wallpaper.\nDetalhes em:\n{LOGFILE}")
+                    return
+            self.start_player()
+        except Exception:
+            log("ERRO no guard:\n" + traceback.format_exc())
 
     # ---- UI
     def build_ui(self):
@@ -388,29 +647,31 @@ class MainWindow(QMainWindow):
         self.showNormal(); self.activateWindow()
 
     def closeEvent(self, e):
-        # fechar a janela só minimiza para a bandeja; o wallpaper continua tocando
         e.ignore()
         self.hide()
-        if self.wallpapers:
+        if self.cfg.get("active"):
             self.tray.showMessage("Wallpaper Animado",
                                   "Continua rodando na bandeja do sistema.",
                                   QSystemTrayIcon.Information, 2500)
 
     def quit_app(self):
-        self.stop_all()
+        self.guard.stop()
+        self.kill_player()
         self.tray.hide()
         QApplication.quit()
 
     # ---- biblioteca
     def refresh_list(self):
+        active = bool(self.cfg.get("active"))
         self.list.clear()
         for f in sorted(LIB_DIR.iterdir()):
             if f.is_file():
-                it = QListWidgetItem(("● " if str(f) == self.cfg.get("current") and self.wallpapers else "   ") + f.name)
+                mark = "● " if active and str(f) == self.cfg.get("current") else "   "
+                it = QListWidgetItem(mark + f.name)
                 it.setData(Qt.UserRole, str(f))
                 self.list.addItem(it)
         self.status.setText(
-            f"Ativo: {Path(self.cfg['current']).name}" if self.wallpapers and self.cfg.get("current")
+            f"Ativo: {Path(self.cfg['current']).name}" if active and self.cfg.get("current")
             else "Wallpaper animado desativado")
 
     def add_video(self):
@@ -430,6 +691,7 @@ class MainWindow(QMainWindow):
             return
         if path == self.cfg.get("current"):
             self.deactivate()
+            time.sleep(1.2)  # deixa o player soltar o arquivo
         try:
             os.remove(path)
         except OSError:
@@ -443,94 +705,30 @@ class MainWindow(QMainWindow):
             return
         self.activate(it.data(Qt.UserRole))
 
-    # ---- wallpaper
-    def stop_all(self):
-        self.paused = False
-        for w in self.wallpapers:
-            w.stop()
-        self.wallpapers = []
-
-    def activate(self, path, keep_position=False):
+    # ---- wallpaper (so grava config; o player obedece)
+    def activate(self, path):
         if not Path(path).exists():
-            return
-        pos = 0
-        if keep_position and self.wallpapers:
-            try:
-                pos = int(self.wallpapers[0].player.position())
-            except Exception:
-                pos = 0
-        self.stop_all()
-        try:
-            for sc in QApplication.screens():
-                w = ScreenWallpaper(sc, path, self.chk_mute.isChecked(), self.vol.value(),
-                                    self.cfg["fill"], pos)
-                self.wallpapers.append(w)
-                w.start()
-        except Exception as ex:
-            import traceback
-            log(traceback.format_exc())
-            self.stop_all()
-            self.cfg["active"] = False
-            self.refresh_list()
-            QMessageBox.critical(self, "Erro ao ativar",
-                                 f"Nao foi possivel ativar o wallpaper:\n{ex}\n\nDetalhes em:\n{DATA_DIR / 'log.txt'}")
             return
         self.cfg["current"], self.cfg["active"] = path, True
         self.save_config()
+        self.start_player()  # se ja estiver rodando, ele troca de video sozinho
         self.refresh_list()
 
     def deactivate(self):
-        self.stop_all()
         self.cfg["active"] = False
-        self.save_config()
+        self.save_config()  # o player ve e encerra em ate ~1s
         self.refresh_list()
-
-    def on_autopause(self, on):
-        self.cfg["autopause"] = on
-        self.save_config()
-
-    def guard_tick(self):
-        if not self.wallpapers or not self.cfg.get("current"):
-            self.paused = False
-            self.was_fs = False
-            return
-        try:
-            fs = fullscreen_app_active()
-            if fs:
-                self.was_fs = True
-                if self.cfg.get("autopause", False) and not self.paused:
-                    self.paused = True
-                    for w in self.wallpapers:
-                        w.player.pause()
-                return  # durante a tela cheia nao mexe em nada (o video segue tocando)
-            # nao ha app em tela cheia agora
-            if self.paused or self.was_fs:
-                # acabou de sair do jogo: refaz o wallpaper e continua de onde estava
-                self.paused = False
-                self.was_fs = False
-                self.activate(self.cfg["current"], keep_position=True)
-            elif not all(w.healthy() for w in self.wallpapers):
-                log("wallpaper desencaixado/destruido; recriando")
-                self.activate(self.cfg["current"], keep_position=True)
-            else:
-                for w in self.wallpapers:
-                    if w.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-                        w.player.play()
-        except Exception:
-            import traceback
-            log(traceback.format_exc())
 
     def on_audio(self, *_):
         self.cfg["muted"], self.cfg["volume"] = self.chk_mute.isChecked(), self.vol.value()
-        for w in self.wallpapers:
-            w.audio.setMuted(self.cfg["muted"])
-            w.audio.setVolume(self.cfg["volume"] / 100)
         self.save_config()
 
     def on_fit(self, idx):
         self.cfg["fill"] = idx == 0
-        for w in self.wallpapers:
-            w.setAspectRatioMode(Qt.KeepAspectRatioByExpanding if self.cfg["fill"] else Qt.KeepAspectRatio)
+        self.save_config()
+
+    def on_autopause(self, on):
+        self.cfg["autopause"] = on
         self.save_config()
 
     # ---- iniciar com o Windows
@@ -566,9 +764,14 @@ def main():
     if sys.platform != "win32":
         print("Este app é para Windows.")
         sys.exit(1)
+    if "--player" in sys.argv:
+        i = sys.argv.index("--player")
+        pid = int(sys.argv[i + 1]) if len(sys.argv) > i + 1 else 0
+        run_player(pid)
+        return
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    win = MainWindow(start_hidden="--hidden" in sys.argv)
+    win = MainWindow(start_hidden="--hidden" in sys.argv)  # noqa: F841
     sys.exit(app.exec())
 
 
