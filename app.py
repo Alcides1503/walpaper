@@ -30,44 +30,87 @@ DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 LIB_DIR = DATA_DIR / "videos"
 CONFIG = DATA_DIR / "config.json"
 
-user32 = ctypes.windll.user32 if sys.platform == "win32" else None
+HWND = wintypes.HWND
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, HWND, wintypes.LPARAM)
+
+if sys.platform == "win32":
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user32.FindWindowW.restype = HWND
+    user32.FindWindowExW.argtypes = [HWND, HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user32.FindWindowExW.restype = HWND
+    user32.SendMessageTimeoutW.argtypes = [HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                           wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+    user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.SetParent.argtypes = [HWND, HWND]
+    user32.SetParent.restype = HWND
+    user32.MoveWindow.argtypes = [HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+    user32.MoveWindow.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.GetWindowLongPtrW.argtypes = [HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.SetWindowLongPtrW.argtypes = [HWND, ctypes.c_int, ctypes.c_ssize_t]
+    user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+else:
+    user32 = None
+
+
+def log(msg):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(DATA_DIR / "log.txt", "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------- Win32 ----
 def _find_desktop_host():
-    """Retorna o HWND (WorkerW/Progman) onde o vídeo deve ser encaixado,
-    ficando atrás dos ícones. Funciona no Windows 10 e no Windows 11 (incl. 24H2)."""
+    """Retorna o HWND (WorkerW/Progman) onde o video deve ser encaixado,
+    atras dos icones. Funciona no Windows 10 e no Windows 11 (incl. 24H2)."""
     progman = user32.FindWindowW("Progman", None)
-    res = wintypes.DWORD()
-    # Pede ao Explorer para criar a janela WorkerW atrás dos ícones
+    if not progman:
+        raise RuntimeError("Janela Progman nao encontrada")
+    res = ctypes.c_size_t()
+    # Pede ao Explorer para criar a janela WorkerW atras dos icones
     for wparam, lparam in ((0xD, 0), (0xD, 1), (0, 0)):
         user32.SendMessageTimeoutW(progman, 0x052C, wparam, lparam, 0, 1000, ctypes.byref(res))
 
-    # Windows 11 24H2+: WorkerW é filho do Progman
-    child = user32.FindWindowExW(progman, 0, "WorkerW", None)
+    # Windows 11 24H2+: WorkerW e filho do Progman
+    child = user32.FindWindowExW(progman, None, "WorkerW", None)
     if child:
+        log("host: WorkerW filho do Progman")
         return child
 
-    # Windows 10 / 11 antigo: WorkerW irmão logo após o que contém os ícones
+    # Windows 10 / 11 antigo: WorkerW irmao logo apos o que contem os icones
     found = []
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def enum_proc(hwnd, _):
-        if user32.FindWindowExW(hwnd, 0, "SHELLDLL_DefView", None):
-            w = user32.FindWindowExW(0, hwnd, "WorkerW", None)
+        if user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None):
+            w = user32.FindWindowExW(None, hwnd, "WorkerW", None)
             if w:
                 found.append(w)
         return True
 
-    user32.EnumWindows(enum_proc, 0)
-    return found[0] if found else progman
+    cb = WNDENUMPROC(enum_proc)
+    user32.EnumWindows(cb, 0)
+    if found:
+        log("host: WorkerW irmao")
+        return found[0]
+    log("host: usando Progman")
+    return progman
 
 
 def _attach_to_desktop(widget, host, x, y, w, h):
     hwnd = int(widget.winId())
     GWL_STYLE, WS_CHILD, WS_POPUP = -16, 0x40000000, 0x80000000
-    style = user32.GetWindowLongW(hwnd, GWL_STYLE)
-    user32.SetWindowLongW(hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD)
+    style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
+    user32.SetWindowLongPtrW(hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD)
     user32.SetParent(hwnd, host)
     # coordenadas relativas ao host (origem = canto do desktop virtual)
     vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
@@ -79,7 +122,8 @@ def _attach_to_desktop(widget, host, x, y, w, h):
 class ScreenWallpaper(QVideoWidget):
     def __init__(self, screen, path, muted, volume, fill):
         super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
+        self.screen_ref = screen
+        self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setAspectRatioMode(
             Qt.KeepAspectRatioByExpanding if fill else Qt.KeepAspectRatio
@@ -93,21 +137,27 @@ class ScreenWallpaper(QVideoWidget):
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self)
         self.player.setLoops(QMediaPlayer.Loops.Infinite)
+        self.player.errorOccurred.connect(lambda e, msg: log(f"erro player: {e} {msg}"))
         self.player.setSource(QUrl.fromLocalFile(str(path)))
 
-        dpr = screen.devicePixelRatio()
-        g = screen.geometry()
+    def start(self):
+        dpr = self.screen_ref.devicePixelRatio()
+        g = self.screen_ref.geometry()
         x, y = int(g.x() * dpr), int(g.y() * dpr)
         w, h = int(g.width() * dpr), int(g.height() * dpr)
-        self.show()
+        self.winId()  # garante o HWND antes de encaixar
         _attach_to_desktop(self, _find_desktop_host(), x, y, w, h)
+        self.show()
         self.player.play()
 
     def stop(self):
-        self.player.stop()
-        self.player.setVideoOutput(None)
-        self.close()
-        self.deleteLater()
+        try:
+            self.player.stop()
+            self.player.setVideoOutput(None)
+            self.close()
+            self.deleteLater()
+        except Exception:
+            pass
 
 
 # -------------------------------------------------------------- Janela ------
@@ -307,9 +357,20 @@ class MainWindow(QMainWindow):
         if not Path(path).exists():
             return
         self.stop_all()
-        for s in QApplication.screens():
-            self.wallpapers.append(ScreenWallpaper(
-                s, path, self.chk_mute.isChecked(), self.vol.value(), self.cfg["fill"]))
+        try:
+            for sc in QApplication.screens():
+                w = ScreenWallpaper(sc, path, self.chk_mute.isChecked(), self.vol.value(), self.cfg["fill"])
+                self.wallpapers.append(w)
+                w.start()
+        except Exception as ex:
+            import traceback
+            log(traceback.format_exc())
+            self.stop_all()
+            self.cfg["active"] = False
+            self.refresh_list()
+            QMessageBox.critical(self, "Erro ao ativar",
+                                 f"Nao foi possivel ativar o wallpaper:\n{ex}\n\nDetalhes em:\n{DATA_DIR / 'log.txt'}")
+            return
         self.cfg["current"], self.cfg["active"] = path, True
         self.save_config()
         self.refresh_list()
