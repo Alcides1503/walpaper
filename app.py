@@ -106,12 +106,16 @@ def _find_desktop_host():
     return progman
 
 
-def _attach_to_desktop(widget, host, x, y, w, h):
+def _attach_to_desktop(widget, host):
     hwnd = int(widget.winId())
     GWL_STYLE, WS_CHILD, WS_POPUP = -16, 0x40000000, 0x80000000
     style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
     user32.SetWindowLongPtrW(hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD)
     user32.SetParent(hwnd, host)
+
+
+def _place(widget, x, y, w, h):
+    hwnd = int(widget.winId())
     # coordenadas relativas ao host (origem = canto do desktop virtual)
     vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
     user32.MoveWindow(hwnd, x - vx, y - vy, w, h, True)
@@ -143,12 +147,22 @@ class ScreenWallpaper(QVideoWidget):
     def start(self):
         dpr = self.screen_ref.devicePixelRatio()
         g = self.screen_ref.geometry()
-        x, y = int(g.x() * dpr), int(g.y() * dpr)
-        w, h = int(g.width() * dpr), int(g.height() * dpr)
+        self._rect = (int(g.x() * dpr), int(g.y() * dpr),
+                      int(g.width() * dpr), int(g.height() * dpr))
         self.winId()  # garante o HWND antes de encaixar
-        _attach_to_desktop(self, _find_desktop_host(), x, y, w, h)
         self.show()
+        _attach_to_desktop(self, _find_desktop_host())
+        _place(self, *self._rect)
         self.player.play()
+        # o Qt pode reaplicar o tamanho padrao depois de exibir; reaplica o tamanho da tela
+        for ms in (100, 400, 1200):
+            QTimer.singleShot(ms, self._reapply)
+
+    def _reapply(self):
+        try:
+            _place(self, *self._rect)
+        except Exception:
+            pass
 
     def stop(self):
         try:
