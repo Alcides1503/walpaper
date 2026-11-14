@@ -113,6 +113,9 @@ if sys.platform == "win32":
     user32.IsIconic.restype = wintypes.BOOL
     user32.GetParent.argtypes = [HWND]
     user32.GetParent.restype = HWND
+    user32.SetWindowPos.argtypes = [HWND, HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, wintypes.UINT]
+    user32.SetWindowPos.restype = wintypes.BOOL
     user32.GetWindowRect.argtypes = [HWND, ctypes.POINTER(wintypes.RECT)]
     user32.GetWindowRect.restype = wintypes.BOOL
     user32.MonitorFromWindow.argtypes = [HWND, wintypes.DWORD]
@@ -125,6 +128,8 @@ if sys.platform == "win32":
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
 else:
     user32 = None
     kernel32 = None
@@ -137,6 +142,22 @@ class MONITORINFO(ctypes.Structure):
 
 SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
                  "SHELLDLL_DefView", "XamlExplorerHostIslandWindow"}
+
+
+_MUTEXES = []
+
+
+def acquire_mutex(name):
+    """True se conseguiu ser a unica instancia com esse nome."""
+    h = kernel32.CreateMutexW(None, False, name)
+    already = ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+    if not h:
+        return True
+    if already:
+        kernel32.CloseHandle(h)
+        return False
+    _MUTEXES.append(h)  # mantem vivo ate o processo terminar
+    return True
 
 
 def pid_alive(pid):
@@ -199,25 +220,36 @@ def _find_workerw():
 
 
 def find_desktop_host():
-    """HWND onde o video e encaixado, atras dos icones (Windows 10 e 11)."""
+    """HWND onde o video e encaixado, atras dos icones (Windows 10 e 11).
+    Nunca devolve o Progman (colocaria o video POR CIMA dos icones): se nao achar, levanta erro."""
     progman = user32.FindWindowW("Progman", None)
     if not progman:
         raise RuntimeError("Janela Progman nao encontrada")
     res = ctypes.c_size_t()
-    for wparam, lparam in ((0xD, 0), (0xD, 1), (0, 0)):
-        user32.SendMessageTimeoutW(progman, 0x052C, wparam, lparam, 0, 500, ctypes.byref(res))
-        host = _find_workerw()
-        if host:
-            return host
-    return progman
+    for _ in range(4):
+        for wparam, lparam in ((0xD, 0), (0xD, 1), (0, 0)):
+            user32.SendMessageTimeoutW(progman, 0x052C, wparam, lparam, 0, 500, ctypes.byref(res))
+            host = _find_workerw()
+            if host:
+                # garante que o WorkerW fica no fundo (atras dos icones)
+                user32.SetWindowPos(host, 1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)  # HWND_BOTTOM
+                return host
+        time.sleep(0.3)
+    raise RuntimeError("WorkerW (fundo da area de trabalho) nao encontrado")
 
 
 def attach_to_desktop(widget, host):
     hwnd = int(widget.winId())
     GWL_STYLE, WS_CHILD, WS_POPUP = -16, 0x40000000, 0x80000000
+    GWL_EXSTYLE = -20
     style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
     user32.SetWindowLongPtrW(hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD)
+    ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+    ex = (ex | 0x80 | 0x08000000) & ~0x40000  # TOOLWINDOW | NOACTIVATE, sem APPWINDOW
+    user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex)
     user32.SetParent(hwnd, host)
+    if user32.GetParent(hwnd) != host:
+        raise RuntimeError("Nao foi possivel encaixar o video no desktop (SetParent falhou)")
 
 
 def place(widget, x, y, w, h):
@@ -234,8 +266,9 @@ class ScreenWallpaper(QVideoWidget):
         self.screen_ref = screen
         self._start_pos = start_pos
         self.host = None
-        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_NativeWindow, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAspectRatioMode(Qt.KeepAspectRatioByExpanding if fill else Qt.KeepAspectRatio)
         self.setStyleSheet("background:black;")
 
@@ -262,15 +295,31 @@ class ScreenWallpaper(QVideoWidget):
         g = self.screen_ref.geometry()
         self._rect = (int(g.x() * dpr), int(g.y() * dpr),
                       int(g.width() * dpr), int(g.height() * dpr))
-        self.setGeometry(g)
-        self.winId()
+        self.winId()  # cria o HWND SEM mostrar a janela
+        try:
+            self.host = find_desktop_host()
+            attach_to_desktop(self, self.host)  # encaixa antes de aparecer: nunca vira janela solta
+        except Exception:
+            self.hide()
+            raise
         self.show()
-        self.host = find_desktop_host()
-        attach_to_desktop(self, self.host)
         place(self, *self._rect)
         self.player.play()
         for ms in (100, 400, 1200):
             QTimer.singleShot(ms, self._reapply)
+
+    def repair(self):
+        """Reencaixa a janela existente no desktop, sem recriar (sem piscar)."""
+        try:
+            self.host = find_desktop_host()
+            attach_to_desktop(self, self.host)
+        except Exception:
+            self.hide()
+            raise
+        place(self, *self._rect)
+        self.player.setVideoOutput(None)
+        self.player.setVideoOutput(self)  # renova a superficie de video
+        self.player.play()
 
     def _reapply(self):
         try:
@@ -278,18 +327,25 @@ class ScreenWallpaper(QVideoWidget):
         except Exception:
             pass
 
-    def healthy(self, strict=True):
+    def alive(self):
+        """False se a janela ou o desktop host foram destruidos (precisa recriar)."""
         try:
             hwnd = int(self.winId())
-            ok = bool(user32.IsWindow(self.host) and user32.IsWindow(hwnd))
-            if ok and strict:
-                ok = user32.GetParent(hwnd) == self.host
-            return ok
+            return bool(user32.IsWindow(self.host) and user32.IsWindow(hwnd))
+        except Exception:
+            return False
+
+    def attached(self):
+        """True se continua filha do desktop host e visivel."""
+        try:
+            hwnd = int(self.winId())
+            return user32.GetParent(hwnd) == self.host and bool(user32.IsWindowVisible(hwnd))
         except Exception:
             return False
 
     def stop(self):
         try:
+            self.hide()
             self.player.stop()
             self.player.setVideoOutput(None)
             self.close()
@@ -310,7 +366,11 @@ class PlayerApp:
         self.paused = False
         self.was_fs = False
         self.rebuilds = []
-        self.strict = True
+        self.last_pos = -1
+        self.stuck = 0
+        self.pending = None
+        self.retry_at = 0
+        self.fail_count = 0
         self.n = 0
         self.timer = QTimer()
         self.timer.timeout.connect(self.tick)
@@ -342,34 +402,113 @@ class PlayerApp:
             w.audio.setVolume(self.cfg["volume"] / 100)
             w.setAspectRatioMode(Qt.KeepAspectRatioByExpanding if self.cfg["fill"] else Qt.KeepAspectRatio)
 
-    def build(self, path, keep_position=False):
-        pos = 0
-        if keep_position and self.wallpapers:
-            try:
-                pos = int(self.wallpapers[0].player.position())
-            except Exception:
-                pos = 0
+    def build(self, path, keep_position=False, pos=None):
+        if pos is None:
+            pos = 0
+            if keep_position and self.wallpapers:
+                try:
+                    pos = int(self.wallpapers[0].player.position())
+                except Exception:
+                    pos = 0
         self.stop_walls()
         for sc in QApplication.screens():
             w = ScreenWallpaper(sc, path, self.cfg["muted"], self.cfg["volume"], self.cfg["fill"], pos)
             self.wallpapers.append(w)
             w.start()
         self.current = path
+        self.last_pos = -1
+        self.stuck = 0
+
+    def safe_build(self, path, keep_position=False, pos=None):
+        """Recria o wallpaper; se o desktop ainda nao estiver pronto, tenta de novo em 2s."""
+        if pos is None:
+            pos = 0
+            if keep_position and self.wallpapers:
+                try:
+                    pos = int(self.wallpapers[0].player.position())
+                except Exception:
+                    pos = 0
+        try:
+            self.build(path, pos=pos)
+            self.pending = None
+            self.fail_count = 0
+        except Exception:
+            self.fail_count += 1
+            log(f"falha ao montar wallpaper (tentativa {self.fail_count}):\n" + traceback.format_exc())
+            self.stop_walls()
+            self.current = None
+            if self.fail_count >= 6:
+                raise
+            self.pending = (path, pos)
+            self.retry_at = time.time() + 2
 
     def stop_walls(self):
         for w in self.wallpapers:
             w.stop()
         self.wallpapers = []
 
+    def check_frozen(self):
+        """Se o video diz que toca mas a posicao nao anda por ~6s, recria."""
+        if not self.wallpapers:
+            return False
+        try:
+            p = self.wallpapers[0].player
+            playing = p.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            pos = int(p.position())
+        except Exception:
+            return False
+        if playing and pos == self.last_pos:
+            self.stuck += 1
+        else:
+            self.stuck = 0
+        self.last_pos = pos
+        if self.stuck >= 3:
+            log("video congelado (posicao parada); recriando")
+            self.stuck = 0
+            self.rebuild()
+            return True
+        return False
+
+    def after_fullscreen(self):
+        try:
+            if fullscreen_app_active():
+                self.was_fs = True  # voltou para tela cheia; espera de novo
+                return
+            if not self.wallpapers or not self.current:
+                return
+            log("saiu da tela cheia; recriando wallpaper")
+            self.safe_build(self.current, keep_position=True)  # recriacao completa, sem piscar
+        except Exception:
+            log("ERRO apos tela cheia:\n" + traceback.format_exc())
+
+    def fix_all(self, force):
+        if not force and self.check_frozen():
+            return
+        if not all(w.alive() for w in self.wallpapers):
+            log("janela/desktop destruido; recriando")
+            self.rebuild()
+            return
+        for w in self.wallpapers:
+            if force or not w.attached():
+                if not force:
+                    log("wallpaper desencaixado; reencaixando")
+                try:
+                    w.repair()
+                except Exception:
+                    log("repair falhou; recriando:\n" + traceback.format_exc())
+                    self.rebuild()
+                    return
+            elif w.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                w.player.play()
+
     def rebuild(self):
         now = time.time()
         self.rebuilds = [t for t in self.rebuilds if now - t < 60]
         if len(self.rebuilds) >= 6:
             log("muitas recriacoes em 1 minuto; ignorando")
-            self.strict = False
             return
         self.rebuilds.append(now)
-        self.build(self.current, keep_position=True)
+        self.safe_build(self.current, keep_position=True)
 
     def quit(self):
         self.timer.stop()
@@ -390,12 +529,19 @@ class PlayerApp:
             if not Path(path).exists():
                 log("video nao existe: " + path)
                 return self.quit()
+            if self.pending:
+                if time.time() >= self.retry_at:
+                    p, pos = self.pending
+                    self.safe_build(p, pos=pos)
+                return
             if path != self.current:
-                self.build(path)
+                self.safe_build(path)
                 return
 
             fs = fullscreen_app_active()
             if fs:
+                if not self.was_fs:
+                    log("tela cheia detectada")
                 self.was_fs = True
                 if self.cfg.get("autopause") and not self.paused:
                     self.paused = True
@@ -405,15 +551,10 @@ class PlayerApp:
             if self.paused or self.was_fs:
                 self.paused = False
                 self.was_fs = False
-                self.rebuild()  # saiu do jogo: refaz e continua de onde estava
+                # saiu do F11/jogo: espera o Windows terminar de redesenhar e recria o wallpaper
+                QTimer.singleShot(700, self.after_fullscreen)
             elif self.n % 4 == 0:
-                if not all(w.healthy(self.strict) for w in self.wallpapers):
-                    log("wallpaper desencaixado/destruido; recriando")
-                    self.rebuild()
-                else:
-                    for w in self.wallpapers:
-                        if w.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-                            w.player.play()
+                self.fix_all(force=False)
         except Exception:
             log("ERRO no player:\n" + traceback.format_exc())
             self.timer.stop()
@@ -422,6 +563,14 @@ class PlayerApp:
 
 
 def run_player(parent_pid):
+    # espera um player antigo (de outro controle) terminar; nunca ha dois ao mesmo tempo
+    for _ in range(24):
+        if acquire_mutex("Local\\WallpaperAnimadoPlayer"):
+            break
+        time.sleep(0.25)
+    else:
+        log("outro player ainda ativo; saindo")
+        sys.exit(3)
     app = QApplication([sys.argv[0]])
     app.setQuitOnLastWindowClosed(False)
     pa = PlayerApp(parent_pid)  # noqa: F841 (mantem referencia viva)
@@ -833,6 +982,11 @@ def main():
         pid = int(sys.argv[i + 1]) if len(sys.argv) > i + 1 else 0
         run_player(pid)
         return
+    if not acquire_mutex("Local\\WallpaperAnimadoControle"):
+        ctypes.windll.user32.MessageBoxW(
+            None, "O Wallpaper Animado já está aberto.\nProcure o ícone perto do relógio (bandeja).",
+            "Wallpaper Animado", 0x40)
+        sys.exit(0)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     win = MainWindow(start_hidden="--hidden" in sys.argv)  # noqa: F841
