@@ -177,9 +177,10 @@ def _place(widget, x, y, w, h):
 
 # ------------------------------------------------------------- Wallpaper ----
 class ScreenWallpaper(QVideoWidget):
-    def __init__(self, screen, path, muted, volume, fill):
+    def __init__(self, screen, path, muted, volume, fill, start_pos=0):
         super().__init__()
         self.screen_ref = screen
+        self._start_pos = start_pos
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setAspectRatioMode(
@@ -195,7 +196,15 @@ class ScreenWallpaper(QVideoWidget):
         self.player.setVideoOutput(self)
         self.player.setLoops(QMediaPlayer.Loops.Infinite)
         self.player.errorOccurred.connect(lambda e, msg: log(f"erro player: {e} {msg}"))
+        if start_pos > 0:
+            self.player.mediaStatusChanged.connect(self._seek_once)
         self.player.setSource(QUrl.fromLocalFile(str(path)))
+
+    def _seek_once(self, status):
+        if self._start_pos > 0 and status in (QMediaPlayer.MediaStatus.LoadedMedia,
+                                              QMediaPlayer.MediaStatus.BufferedMedia):
+            pos, self._start_pos = self._start_pos, 0
+            self.player.setPosition(pos)
 
     def start(self):
         dpr = self.screen_ref.devicePixelRatio()
@@ -262,6 +271,7 @@ class MainWindow(QMainWindow):
         self.resize(520, 520)
         self.wallpapers = []
         self.paused = False
+        self.was_fs = False
         self.cfg = self.load_config()
         self.build_ui()
         self.build_tray()
@@ -285,7 +295,7 @@ class MainWindow(QMainWindow):
             for f in bundled.iterdir():
                 if f.is_file() and not (LIB_DIR / f.name).exists():
                     shutil.copy2(f, LIB_DIR / f.name)
-        cfg = {"current": None, "active": False, "muted": True, "volume": 50, "fill": True, "autopause": True}
+        cfg = {"current": None, "active": False, "muted": True, "volume": 50, "fill": True, "autopause": False}
         if CONFIG.exists():
             try:
                 cfg.update(json.loads(CONFIG.read_text("utf-8")))
@@ -348,8 +358,8 @@ class MainWindow(QMainWindow):
         frow.addWidget(self.fit)
         lay.addLayout(frow)
 
-        self.chk_pause = QCheckBox("Pausar quando houver jogo/app em tela cheia")
-        self.chk_pause.setChecked(self.cfg["autopause"])
+        self.chk_pause = QCheckBox("Pausar o vídeo em jogo/tela cheia (economiza desempenho)")
+        self.chk_pause.setChecked(self.cfg.get("autopause", False))
         self.chk_pause.toggled.connect(self.on_autopause)
         lay.addWidget(self.chk_pause)
 
@@ -440,13 +450,20 @@ class MainWindow(QMainWindow):
             w.stop()
         self.wallpapers = []
 
-    def activate(self, path):
+    def activate(self, path, keep_position=False):
         if not Path(path).exists():
             return
+        pos = 0
+        if keep_position and self.wallpapers:
+            try:
+                pos = int(self.wallpapers[0].player.position())
+            except Exception:
+                pos = 0
         self.stop_all()
         try:
             for sc in QApplication.screens():
-                w = ScreenWallpaper(sc, path, self.chk_mute.isChecked(), self.vol.value(), self.cfg["fill"])
+                w = ScreenWallpaper(sc, path, self.chk_mute.isChecked(), self.vol.value(),
+                                    self.cfg["fill"], pos)
                 self.wallpapers.append(w)
                 w.start()
         except Exception as ex:
@@ -475,22 +492,26 @@ class MainWindow(QMainWindow):
     def guard_tick(self):
         if not self.wallpapers or not self.cfg.get("current"):
             self.paused = False
+            self.was_fs = False
             return
         try:
-            fs = self.cfg.get("autopause", True) and fullscreen_app_active()
+            fs = fullscreen_app_active()
             if fs:
-                if not self.paused:
+                self.was_fs = True
+                if self.cfg.get("autopause", False) and not self.paused:
                     self.paused = True
                     for w in self.wallpapers:
                         w.player.pause()
-                return
-            if self.paused:
-                # saiu do jogo/tela cheia: recria o wallpaper do zero
+                return  # durante a tela cheia nao mexe em nada (o video segue tocando)
+            # nao ha app em tela cheia agora
+            if self.paused or self.was_fs:
+                # acabou de sair do jogo: refaz o wallpaper e continua de onde estava
                 self.paused = False
-                self.activate(self.cfg["current"])
+                self.was_fs = False
+                self.activate(self.cfg["current"], keep_position=True)
             elif not all(w.healthy() for w in self.wallpapers):
                 log("wallpaper desencaixado/destruido; recriando")
-                self.activate(self.cfg["current"])
+                self.activate(self.cfg["current"], keep_position=True)
             else:
                 for w in self.wallpapers:
                     if w.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
