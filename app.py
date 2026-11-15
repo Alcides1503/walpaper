@@ -689,8 +689,23 @@ class MainWindow(QMainWindow):
         self.guard.timeout.connect(self.guard_tick)
         self.guard.start(2000)
 
+        self.fail2 = 0
+        self.boot_wait = False
+        try:
+            self.refresh_autostart_path()
+        except Exception:
+            log("refresh_autostart_path falhou:\n" + traceback.format_exc())
         if self.cfg.get("active") and self.cfg.get("current"):
-            QTimer.singleShot(1500, self.start_player)
+            if start_hidden:
+                # abriu junto com o Windows: espera a area de trabalho ficar pronta
+                log("inicio automatico: aguardando o Windows terminar de carregar")
+                self.boot_wait = True
+                self.boot_t0 = time.time()
+                self.boot_timer = QTimer(self)
+                self.boot_timer.timeout.connect(self.boot_poll)
+                self.boot_timer.start(1000)
+            else:
+                QTimer.singleShot(1500, self.start_player)
         if not start_hidden:
             self.show()
 
@@ -767,8 +782,26 @@ class MainWindow(QMainWindow):
                 pass
         self.proc = None
 
+    def boot_poll(self):
+        """Roda a cada 1s no inicio automatico, ate a area de trabalho estar pronta."""
+        waited = time.time() - self.boot_t0
+        try:
+            ready = bool(user32.FindWindowW("Shell_TrayWnd", None) and user32.FindWindowW("Progman", None))
+        except Exception:
+            ready = False
+        if (ready and waited >= 5) or waited > 120:
+            self.boot_timer.stop()
+            log(f"inicio automatico: Windows pronto apos {waited:.0f}s; iniciando em 4s")
+            QTimer.singleShot(4000, self._boot_go)
+
+    def _boot_go(self):
+        self.boot_wait = False
+        self.start_player()
+
     def guard_tick(self):
         try:
+            if self.boot_wait:
+                return
             if not self.cfg.get("active") or not self.cfg.get("current"):
                 return
             if self.player_alive():
@@ -778,17 +811,29 @@ class MainWindow(QMainWindow):
                     log("player sem sinal ha 25s (travado); reiniciando")
                     self.kill_player()
                 else:
+                    if time.time() - self.proc_started > 60:
+                        self.fail2 = 0
                     return
             else:
                 code = self.proc.poll() if self.proc is not None else None
                 if code == 2:
-                    self.cfg["active"] = False
-                    self.save_config()
+                    # falha ao montar o wallpaper (ex.: area de trabalho ainda carregando):
+                    # tenta de novo; so desiste depois de varias falhas seguidas
+                    self.fail2 += 1
+                    log(f"player terminou com erro ({self.fail2}x)")
                     self.proc = None
-                    self.refresh_list()
-                    QMessageBox.critical(self, "Erro ao ativar",
-                                         f"Nao foi possivel ativar o wallpaper.\nDetalhes em:\n{LOGFILE}")
-                    return
+                    if self.fail2 >= 8:
+                        self.cfg["active"] = False
+                        self.save_config()
+                        self.refresh_list()
+                        if self.isVisible():
+                            QMessageBox.critical(self, "Erro ao ativar",
+                                                 f"Nao foi possivel ativar o wallpaper.\nDetalhes em:\n{LOGFILE}")
+                        else:
+                            self.tray.showMessage("Wallpaper Animado",
+                                                  f"Nao foi possivel ativar o wallpaper. Veja {LOGFILE}",
+                                                  QSystemTrayIcon.Warning, 5000)
+                        return
             self.start_player()
         except Exception:
             log("ERRO no guard:\n" + traceback.format_exc())
@@ -973,31 +1018,66 @@ class MainWindow(QMainWindow):
 
     # ---- iniciar com o Windows
     RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 
-    def autostart_enabled(self):
+    def autostart_cmd(self):
+        if getattr(sys, "frozen", False):
+            return f'"{sys.executable}" --hidden'
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        return f'"{pyw}" "{Path(__file__).resolve()}" --hidden'
+
+    def autostart_value(self):
         try:
             import winreg
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.RUN_KEY) as k:
-                winreg.QueryValueEx(k, APP_NAME)
-                return True
+                return winreg.QueryValueEx(k, APP_NAME)[0]
         except Exception:
-            return False
+            return None
 
-    def set_autostart(self, on):
+    def autostart_enabled(self):
+        return self.autostart_value() is not None
+
+    def refresh_autostart_path(self):
+        """Se o app foi movido, atualiza o caminho gravado no registro."""
+        cur = self.autostart_value()
+        if cur is not None and cur != self.autostart_cmd():
+            log("atualizando caminho do inicio automatico")
+            self.write_autostart(True)
+
+    def write_autostart(self, on):
         import winreg
-        if getattr(sys, "frozen", False):
-            cmd = f'"{sys.executable}" --hidden'
-        else:
-            pyw = Path(sys.executable).with_name("pythonw.exe")
-            cmd = f'"{pyw}" "{Path(__file__).resolve()}" --hidden'
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.RUN_KEY) as k:
             if on:
-                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, cmd)
+                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, self.autostart_cmd())
             else:
                 try:
                     winreg.DeleteValue(k, APP_NAME)
                 except FileNotFoundError:
                     pass
+        # Windows 11: "Aplicativos de inicializacao" pode ter o item marcado como desativado
+        try:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.APPROVED_KEY) as k:
+                if on:
+                    winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_BINARY, b"\x02" + b"\x00" * 11)
+                else:
+                    try:
+                        winreg.DeleteValue(k, APP_NAME)
+                    except FileNotFoundError:
+                        pass
+        except Exception:
+            log("StartupApproved:\n" + traceback.format_exc())
+
+    def set_autostart(self, on):
+        try:
+            self.write_autostart(on)
+            log(f"inicio automatico {'ativado' if on else 'desativado'}: {self.autostart_cmd()}")
+        except Exception as ex:
+            log("autostart falhou:\n" + traceback.format_exc())
+            self.chk_boot.blockSignals(True)
+            self.chk_boot.setChecked(not on)
+            self.chk_boot.blockSignals(False)
+            QMessageBox.warning(self, "Iniciar com o Windows",
+                                f"Nao foi possivel alterar a inicializacao automatica:\n{ex}")
 
 
 def main():
